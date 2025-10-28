@@ -1,0 +1,326 @@
+# -*- coding: utf-8 -*-
+"""
+Inventory Baseline Runner (PTO baselines) — with Progress Bars & Timestamped Outputs
+------------------------------------------------------------------------------------
+- Decision-cost scorer (make_scorer).
+- Low-cardinality one-hot encoding (avoid blow-ups).
+- Manual grid search with tqdm progress bars for each model.
+- CV=2 (fast) using sklearn.cross_validate with n_jobs=-1.
+- Time-based split if `date` exists, else GroupKFold by `sku`, else random.
+- Baselines: Ridge, RandomForest, QuantileGBM (τ = cu/(co+cu)).
+- Saves a timestamped summary CSV to --outdir (default: current dir).
+
+Usage:
+  python inventory_baseline_runner.py --csv your_data.csv --co 1 --cu 4 --outdir results/ --save_pred preds.csv
+"""
+
+import argparse
+import json
+import os
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split, GroupKFold, cross_validate, ParameterGrid
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import make_scorer
+from sklearn.base import clone
+
+from tqdm.auto import tqdm
+
+RANDOM_STATE = 42
+
+# -------------------- Decision-cost utilities --------------------
+def decision_cost(y_true, y_pred, co, cu) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    over = np.clip(y_pred - y_true, 0, None)
+    under = np.clip(y_true - y_pred, 0, None)
+    return float(np.mean(co * over + cu * under))
+
+def decision_cost_scorer(co, cu):
+    # make_scorer will return NEGATIVE of decision_cost since greater_is_better=False
+    return make_scorer(decision_cost, greater_is_better=False, co=co, cu=cu)
+
+# -------------------- Data prep helpers --------------------
+def auto_rename(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename common columns to standardized names: date, sku, store, demand, competitor_price, etc."""
+    mapping = {}
+    for col in df.columns:
+        low = col.strip().lower()
+        if low in ["units sold", "sales", "quantity", "qty", "demand", "units_sold"]:
+            mapping[col] = "demand"
+        elif low in ["date", "order date", "dt"]:
+            mapping[col] = "date"
+        elif low in ["product id", "sku", "item", "item id"]:
+            mapping[col] = "sku"
+        elif low in ["store id", "store", "location"]:
+            mapping[col] = "store_id"
+        elif low in ["holiday/promotion", "holiday", "promotion", "promo", "is_holiday", "is_promo"]:
+            mapping[col] = "holiday"
+        elif low in ["weather condition", "weather", "weather cond", "weather_cor"]:
+            mapping[col] = "weather"
+        elif low in ["competitor price", "competitor_price", "comp price", "comp_price"]:
+            mapping[col] = "competitor_price"
+        elif low in ["inventory level", "inventory", "on_hand"]:
+            mapping[col] = "inventory"
+        elif low in ["demand forecast", "forecast", "fcst", "predicted demand"]:
+            mapping[col] = "demand_forecast"
+        elif low in ["price", "unit price"]:
+            mapping[col] = "price"
+        elif low in ["discount", "disc"]:
+            mapping[col] = "discount"
+        elif low in ["category"]:
+            mapping[col] = "category"
+        elif low in ["region"]:
+            mapping[col] = "region"
+        elif low in ["seasonality", "season"]:
+            mapping[col] = "seasonality"
+        elif low in ["units ordered", "order qty", "ordered units"]:
+            mapping[col] = "units_ordered"
+    if mapping:
+        df = df.rename(columns=mapping)
+    return df
+
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Create simple date-derived features and ensure dtypes."""
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        # Drop rows with invalid dates
+        df = df[~df["date"].isna()].copy()
+        df["year"] = df["date"].dt.year
+        df["month"] = df["date"].dt.month
+        df["dayofweek"] = df["date"].dt.dayofweek
+        df["weekofyear"] = df["date"].dt.isocalendar().week.astype(int)
+    # Normalize holiday column to int 0/1 if it exists
+    if "holiday" in df.columns:
+        df["holiday"] = (df["holiday"].astype(str).str.strip().str.lower().isin(
+            ["1", "true", "yes", "y", "t"]
+        ) | (pd.to_numeric(df["holiday"], errors="coerce") > 0)).astype(int)
+    return df
+
+def smart_split(df: pd.DataFrame, target_col: str, date_col: str = "date", group_col: str = "sku",
+                test_size: float = 0.2):
+    """
+    Priority: time split by `date` -> group split by `sku` -> random split.
+    Returns: X_train, X_valid, X_test, y_train, y_valid, y_test
+    """
+    df = df.copy()
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found after auto-rename. "
+                         f"Ensure your demand column exists (e.g., 'Units Sold').")
+    y = df[target_col].values
+    X = df.drop(columns=[target_col])
+
+    if date_col in X.columns and pd.api.types.is_datetime64_any_dtype(X[date_col]):
+        df_sorted = pd.concat([X, pd.Series(y, name=target_col)], axis=1).sort_values(date_col)
+        n = len(df_sorted)
+        n_test = int(np.ceil(test_size * n))
+        n_trainval = n - n_test
+        n_valid = int(np.ceil(0.2 * n_trainval))
+        train = df_sorted.iloc[: n_trainval - n_valid]
+        valid = df_sorted.iloc[n_trainval - n_valid : n_trainval]
+        test  = df_sorted.iloc[n_trainval :]
+        X_train, y_train = train.drop(columns=[target_col]), train[target_col].values
+        X_valid, y_valid = valid.drop(columns=[target_col]), valid[target_col].values
+        X_test , y_test  = test.drop(columns=[target_col]),  test[target_col].values
+        return X_train, X_valid, X_test, y_train, y_valid, y_test
+
+    if group_col in X.columns:
+        groups = X[group_col].astype(str).values
+        gkf = GroupKFold(n_splits=5)
+        idx = np.arange(len(X))
+        first_train_idx, first_test_idx = next(gkf.split(idx, y, groups))
+        X_train, y_train = X.iloc[first_train_idx], y[first_train_idx]
+        X_tmp, y_tmp = X.iloc[first_test_idx], y[first_test_idx]
+        X_valid, X_test, y_valid, y_test = train_test_split(
+            X_tmp, y_tmp, test_size=0.5, random_state=RANDOM_STATE
+        )
+        return X_train, X_valid, X_test, y_train, y_valid, y_test
+
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=RANDOM_STATE
+    )
+    X_train, X_valid, y_train, y_valid = train_test_split(
+        X_trainval, y_trainval, test_size=0.25, random_state=RANDOM_STATE
+    )
+    return X_train, X_valid, X_test, y_train, y_valid, y_test
+
+def build_preprocessor(X: pd.DataFrame, low_card_thresh: int = 50) -> ColumnTransformer:
+    """
+    Only one-hot low-cardinality categoricals; skip high-cardinality columns (avoid blow-up).
+    """
+    num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+    cat_all  = [c for c in X.columns if c not in num_cols]
+
+    cat_low = [c for c in cat_all if X[c].nunique(dropna=True) <= low_card_thresh]
+    cat_high = [c for c in cat_all if c not in cat_low]
+    if len(cat_high) > 0:
+        print(f"[Info] Skipping high-cardinality categoricals (no one-hot): "
+              f"{cat_high[:10]}{'...' if len(cat_high)>10 else ''}")
+
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(with_mean=False), num_cols),
+            ("cat", OneHotEncoder(handle_unknown='ignore'), cat_low),
+        ],
+        remainder="drop",
+        sparse_threshold=0.3,
+    )
+    return pre
+
+# -------------------- Baseline model factories --------------------
+def ridge_baseline(pre, co, cu):
+    pipe = Pipeline([("pre", pre), ("mdl", Ridge(random_state=RANDOM_STATE))])
+    grid = {"mdl__alpha": [0.1, 1.0, 3.0, 10.0, 30.0]}
+    return pipe, grid, decision_cost_scorer(co, cu)
+
+def rf_baseline(pre, co, cu):
+    pipe = Pipeline([("pre", pre),
+                     ("mdl", RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1))])
+    # Lighter grid to avoid long runs
+    grid = {
+        "mdl__n_estimators": [100, 200],
+        "mdl__max_depth": [8, 12],
+        "mdl__min_samples_leaf": [2, 5],
+    }
+    return pipe, grid, decision_cost_scorer(co, cu)
+
+def quantile_baseline(pre, co, cu):
+    tau = cu / (co + cu)
+    pipe = Pipeline([("pre", pre),
+                     ("mdl", GradientBoostingRegressor(loss="quantile", alpha=tau, random_state=RANDOM_STATE))])
+    grid = {
+        "mdl__n_estimators": [200, 400],
+        "mdl__max_depth": [2, 3],
+        "mdl__learning_rate": [0.05, 0.1],
+        "mdl__min_samples_leaf": [1, 4],
+    }
+    return pipe, grid, decision_cost_scorer(co, cu)
+
+# -------------------- Manual grid-search with progress --------------------
+def grid_search_with_progress(name, pipe, grid, scorer, X_train, y_train, cv=2):
+    param_list = list(ParameterGrid(grid)) if grid else [dict()]
+    best_score = -np.inf
+    best_params = None
+
+    pbar = tqdm(param_list, desc=f"GridSearch[{name}]", unit="set")
+    for params in pbar:
+        est = clone(pipe)
+        if params:
+            est.set_params(**params)
+        cvres = cross_validate(est, X_train, y_train, scoring=scorer, cv=cv, n_jobs=-1, return_train_score=False)
+        mean_score = float(np.mean(cvres["test_score"]))
+        if mean_score > best_score:
+            best_score = mean_score
+            best_params = params
+        # tqdm显示当前最好分数（注意 scorer 返回负成本，越大越好）
+        pbar.set_postfix(best_score=f"{best_score:.4f}")
+    return best_params, best_score
+
+def fit_and_eval(name, pipe, grid, scorer,
+                 X_train, y_train, X_valid, y_valid, X_test, y_test, co, cu):
+    # tune
+    best_params, best_score = grid_search_with_progress(name, pipe, grid, scorer, X_train, y_train, cv=2)
+    # refit on full training with best params
+    best_est = clone(pipe)
+    if best_params:
+        best_est.set_params(**best_params)
+    best_est.fit(X_train, y_train)
+
+    # evaluate
+    yhat_val = best_est.predict(X_valid)
+    yhat_tst = best_est.predict(X_test)
+
+    res = {
+        "model": name,
+        "val_cost": decision_cost(y_valid, yhat_val, co, cu),
+        "test_cost": decision_cost(y_test, yhat_tst, co, cu),
+        "best_params": best_params,
+    }
+    return res, best_est
+
+# -------------------- Main --------------------
+def main(args):
+    df = pd.read_csv(args.csv)
+    # Auto rename and feature build
+    df = auto_rename(df)
+    df = build_features(df)
+
+    if "demand" not in df.columns:
+        raise ValueError("Could not find target column 'demand'. "
+                         "Make sure your CSV has 'Units Sold' (will be auto-renamed) or a 'demand' column.")
+
+    # Split
+    X_train, X_valid, X_test, y_train, y_valid, y_test = smart_split(
+        df, target_col="demand", date_col="date", group_col="sku", test_size=args.test_size
+    )
+    print(f"[Info] Split sizes: train={len(y_train)} valid={len(y_valid)} test={len(y_test)}")
+
+    # Build preprocessor with low-cardinality one-hot only
+    pre = build_preprocessor(pd.concat([X_train, X_valid], axis=0), low_card_thresh=args.low_card_thresh)
+
+    co, cu = float(args.co), float(args.cu)
+    print(f"[Info] Costs: c_o={co:.3f}, c_u={cu:.3f} (tau={cu/(co+cu):.3f})")
+
+    configs = [
+        ridge_baseline(pre, co, cu),
+        rf_baseline(pre, co, cu),
+        quantile_baseline(pre, co, cu),
+    ]
+    names = ["Ridge(MSE)", "RandomForest(MSE)", "QuantileGBM(τ)"]
+
+    results = []
+    fitted = []
+    for name, cfg in zip(names, configs):
+        print(f"\n[Running] {name}")
+        pipe, grid, scorer = cfg
+        res, model = fit_and_eval(name, pipe, grid, scorer,
+                                  X_train, y_train, X_valid, y_valid, X_test, y_test, co, cu)
+        results.append(res); fitted.append((name, model))
+        print(f"[Result] {name}: val_cost={res['val_cost']:.4f} test_cost={res['test_cost']:.4f}")
+        print(f"[BestParams] {res['best_params']}")
+
+    tbl = pd.DataFrame(results).sort_values("test_cost")
+    print("\n=== Baseline Summary (lower is better) ===")
+    print(tbl.to_string(index=False))
+
+    # ---------- Save timestamped results ----------
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outdir = args.outdir or "."
+    os.makedirs(outdir, exist_ok=True)
+
+    # Convert best_params to JSON strings for the CSV
+    save_tbl = tbl.copy()
+    save_tbl["best_params"] = save_tbl["best_params"].apply(lambda d: json.dumps(d, ensure_ascii=False))
+
+    out_csv = os.path.join(outdir, f"baseline_results_{ts}.csv")
+    save_tbl.to_csv(out_csv, index=False)
+    print(f"[Saved] Summary results -> {out_csv}")
+
+    if args.save_pred:
+        out_df_list = []
+        for name, mdl in fitted:
+            yhat = mdl.predict(X_test)
+            tmp = pd.DataFrame({"model": name, "y_true": y_test, "y_pred": yhat})
+            out_df_list.append(tmp)
+        out = pd.concat(out_df_list, axis=0, ignore_index=True)
+        out.to_csv(args.save_pred, index=False)
+        print(f"[Saved] Predictions -> {args.save_pred}")
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", type=str, required=True, help="Path to your CSV file.")
+    ap.add_argument("--co", type=float, default=1.0, help="Overage (holding) cost per unit.")
+    ap.add_argument("--cu", type=float, default=4.0, help="Underage (stockout) cost per unit.")
+    ap.add_argument("--test_size", type=float, default=0.2, help="Test size fraction for holdout.")
+    ap.add_argument("--save_pred", type=str, default="", help="Optional path to save test predictions CSV.")
+    ap.add_argument("--low_card_thresh", type=int, default=50, help="Max unique values for a categorical to be one-hot encoded.")
+    ap.add_argument("--outdir", type=str, default=".", help="Directory to save timestamped summary CSV.")
+    args = ap.parse_args()
+    main(args)
