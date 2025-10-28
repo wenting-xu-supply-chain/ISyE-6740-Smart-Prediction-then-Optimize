@@ -1,0 +1,51 @@
+# -*- coding: utf-8 -*-
+"""
+Predict-Then-Optimize (PTO) from Forecast File
+----------------------------------------------
+计算 ARIMA / RF / HYB 三个模型的最优订货量 q* 和决策成本
+输入: 含 Forecast + Std 的 CSV
+输出: baseline_results_<timestamp>.csv
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from scipy.stats import norm
+import os
+
+def decision_cost(y_true, q, co, cu):
+    """Compute decision cost for newsvendor."""
+    over = np.clip(q - y_true, 0, None)
+    under = np.clip(y_true - q, 0, None)
+    return np.mean(co * over + cu * under)
+
+# === Step 1: 读入数据 ===
+df = pd.read_csv("Forecast_Backtest_Last90Days.csv")  # 替换为你的文件名
+
+# === Step 2: 设置成本参数 ===
+co, cu = 1.0, 4.0
+tau = cu / (co + cu)
+z_tau = norm.ppf(tau)
+print(f"[Info] c_o={co}, c_u={cu}, tau={tau:.3f}, z_tau={z_tau:.3f}")
+
+# === Step 3: 计算 q* (optimal order) ===
+df["ARIMA_qstar"] = df["ARIMA_Forecast"] + z_tau * df["ARIMA_Std_Error_Resid"]
+df["RF_qstar"]     = df["RF_Forecast"] + z_tau * df["RF_TotalStd"]
+df["HYB_qstar"]    = df["HYB_Forecast"] + z_tau * df["HYB_PointStd"]
+
+# === Step 4: 计算每个模型的决策成本 ===
+results = []
+for model, q_col in [("ARIMA(τ)", "ARIMA_qstar"), ("RF(mean)", "RF_qstar"), ("HYB(mean)", "HYB_qstar")]:
+    cost = decision_cost(df["Actual_Sales"], df[q_col], co, cu)
+    results.append({"model": model, "test_cost": cost})
+
+tbl = pd.DataFrame(results)
+print("\n=== PTO Optimization Results (lower cost = better) ===")
+print(tbl)
+
+# === Step 5: 保存结果 ===
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+out_csv = f"results/baseline_results_{ts}.csv"
+os.makedirs("results", exist_ok=True)
+tbl.to_csv(out_csv, index=False)
+print(f"[Saved] {out_csv}")
