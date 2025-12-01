@@ -82,7 +82,7 @@ def process_single_sku(df, store_id, prod_id):
     data['day_of_week'] = data['Date'].dt.weekday
     data['month'] = data['Date'].dt.month
 
-    numeric_features = ['Price', 'Discount', 'Competitor Pricing', 'Inventory Level', 'Units Sold', 'Epidemic']
+    numeric_features = ['Price', 'Discount', 'Competitor Pricing', 'Inventory Level‘, 'Epidemic']
     categorical_features = ['Weather Condition', 'Seasonality', 'Promotion', 'day_of_week', 'month']
 
     train_mask = data['Split'] == 'Train'
